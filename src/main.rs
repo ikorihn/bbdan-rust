@@ -1,6 +1,7 @@
 use ansi_term::Colour;
 use chrono::{DateTime, Local};
 use clap::{ArgEnum, Parser, Subcommand};
+use dialoguer::{theme::ColorfulTheme, MultiSelect};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 use std::{default, fs, process};
 
 #[derive(Parser, Debug)]
-#[clap(name = "bbrs", version, about, long_about = None, arg_required_else_help = true)]
+#[clap(name = "bbdan", version, about, long_about = None, arg_required_else_help = true)]
 struct Args {
     /// Username
     #[clap(short, long, value_name = "USERNAME")]
@@ -54,6 +55,8 @@ enum Commands {
     List { repo: String },
     /// Copy permission setting from src_repo to dest_repo
     Copy { src_repo: String, dest_repo: String },
+    /// Remove permission
+    Remove { repo: String },
 }
 
 struct OutputMessage {
@@ -141,6 +144,16 @@ async fn main() {
                 slug: dest_repo,
             };
             copy(src, dest).await;
+        }
+        Commands::Remove { repo } => {
+            let bitbucket = Bitbucket {
+                username: username.to_string(),
+                password: password.to_string(),
+                workspace: workspace.to_string(),
+                slug: repo.to_string(),
+            };
+
+            remove(bitbucket).await;
         }
     }
 }
@@ -380,4 +393,35 @@ async fn copy(
 
     let permissions_after = list(dest).await.ok().unwrap();
     Ok(permissions_after)
+}
+
+async fn remove(bitbucket: Bitbucket) -> Result<(), Box<dyn std::error::Error>> {
+    let permissions = list(bitbucket.clone()).await.ok().unwrap();
+
+    let multiselected: Vec<String> = permissions
+        .iter()
+        .map(|x| {
+            format!(
+                "{:?} - {:?} - {:?} - {:?}",
+                x.object_type, x.id, x.alias, x.permission
+            )
+        })
+        .collect();
+
+    let selections = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Pick permission you want to remove")
+        .items(&multiselected[..])
+        .interact()
+        .unwrap();
+
+    if selections.is_empty() {
+        println!("You did not select anything :(");
+    } else {
+        println!("You selected these things:");
+        for selection in selections {
+            println!("  {}", permissions[selection].alias);
+        }
+    };
+
+    Ok(())
 }
