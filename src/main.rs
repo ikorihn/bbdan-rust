@@ -4,6 +4,7 @@ use clap::{ArgEnum, Parser, Subcommand};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -26,10 +27,6 @@ struct Args {
     #[clap(short, long, value_name = "WORKSPACE")]
     workspace: String,
 
-    /// Repo slug
-    #[clap(short, long)]
-    slug: String,
-
     /// Output type
     #[clap(
         short,
@@ -51,10 +48,12 @@ enum Output {
     Text,
 }
 
-/// サブコマンドの定義
 #[derive(Debug, Subcommand)]
 enum Commands {
-    List,
+    /// List permission of repo
+    List { repo: String },
+    /// Copy permission setting from src_repo to dest_repo
+    Copy { src_repo: String, dest_repo: String },
 }
 
 struct OutputMessage {
@@ -112,19 +111,36 @@ async fn main() {
     let username: String = args.username;
     let password: String = args.password;
     let workspace: String = args.workspace;
-    let slug: String = args.slug;
     let output: Output = args.output;
 
-    let bitbucket = Bitbucket {
-        username,
-        password,
-        workspace,
-        slug,
-    };
-
     match args.command {
-        Commands::List => {
+        Commands::List { repo } => {
+            let bitbucket = Bitbucket {
+                username: username.to_string(),
+                password: password.to_string(),
+                workspace: workspace.to_string(),
+                slug: repo.to_string(),
+            };
+
             list(bitbucket).await;
+        }
+        Commands::Copy {
+            src_repo,
+            dest_repo,
+        } => {
+            let src = Bitbucket {
+                username: username.to_string(),
+                password: password.to_string(),
+                workspace: workspace.to_string(),
+                slug: src_repo,
+            };
+            let dest = Bitbucket {
+                username: username.to_string(),
+                password: password.to_string(),
+                workspace: workspace.to_string(),
+                slug: dest_repo,
+            };
+            copy(src, dest).await;
         }
     }
 }
@@ -133,6 +149,7 @@ async fn main() {
 
 const BASE_URL: &str = "https://api.bitbucket.org/2.0";
 
+#[derive(Debug, Clone)]
 struct Bitbucket {
     username: String,
     password: String,
@@ -157,7 +174,7 @@ struct Permission {
     permission: PermissionType,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObjectType {
     User,
     Group,
@@ -171,7 +188,7 @@ fn object_type_from_str(s: &str) -> ObjectType {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionType {
     Read,
     Write,
@@ -183,6 +200,14 @@ fn permission_type_from_str(s: &str) -> PermissionType {
         "write" => return PermissionType::Write,
         "admin" => return PermissionType::Admin,
         _ => return PermissionType::Read,
+    }
+}
+fn permission_type_to_str(p: PermissionType) -> String {
+    match p {
+        PermissionType::Read => return String::from("read"),
+        PermissionType::Write => return String::from("write"),
+        PermissionType::Admin => return String::from("admin"),
+        _ => return String::from("read"),
     }
 }
 
@@ -252,4 +277,107 @@ async fn list(bitbucket: Bitbucket) -> Result<Vec<Permission>, Box<dyn std::erro
     }
 
     Ok(permissions)
+}
+
+async fn copy(
+    src: Bitbucket,
+    dest: Bitbucket,
+) -> Result<Vec<Permission>, Box<dyn std::error::Error>> {
+    let permissions_src = list(src).await.ok().unwrap();
+    let permissions_before = list(dest.clone()).await.ok().unwrap();
+
+    let mut dest_ids: HashMap<String, &Permission> = HashMap::new();
+    for p in &permissions_before {
+        dest_ids.insert(String::from(&p.id), &p);
+    }
+
+    let mut src_ids: HashSet<String> = HashSet::new();
+    let client = reqwest::Client::new();
+    for p in permissions_src {
+        src_ids.insert(p.id.to_string());
+
+        if dest_ids.contains_key(&p.id) {
+            let dests = dest_ids.get(&p.id).unwrap();
+            if p.permission == dests.permission {
+                println!("Not update: id={}, name={}", p.id, p.alias);
+                continue;
+            } else {
+                println!(
+                    "Permission update: id={}, name={}, before={}, after={}",
+                    p.id,
+                    p.alias,
+                    permission_type_to_str(p.permission),
+                    permission_type_to_str(dests.permission),
+                );
+            }
+        } else {
+            println!("Add: id={}, name={}", p.id, p.alias);
+        }
+
+        let url = if p.object_type == ObjectType::User {
+            format!(
+                r#"{}/repositories/{}/{}/permissions-config/users/{}"#,
+                BASE_URL, dest.workspace, dest.slug, p.id,
+            )
+        } else {
+            format!(
+                r#"{}/repositories/{}/{}/permissions-config/groups/{}"#,
+                BASE_URL, dest.workspace, dest.slug, p.id,
+            )
+        };
+
+        let mut map = HashMap::new();
+        map.insert("permission", permission_type_to_str(p.permission));
+
+        let resp = client
+            .put(url)
+            .basic_auth(&dest.username, Some(&dest.password))
+            .json(&map)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            println!("failed to request");
+            return Ok(vec![]);
+        }
+
+        let result: Value = resp.json().await?;
+        println!("result: {}", result);
+    }
+
+    for p in permissions_before {
+        if src_ids.contains(&p.id) {
+            continue;
+        }
+
+        println!("Remove: id={}, name={}", p.id, p.alias);
+        let url = if p.object_type == ObjectType::User {
+            format!(
+                r#"{}/repositories/{}/{}/permissions-config/users/{}"#,
+                BASE_URL, dest.workspace, dest.slug, p.id,
+            )
+        } else {
+            format!(
+                r#"{}/repositories/{}/{}/permissions-config/groups/{}"#,
+                BASE_URL, dest.workspace, dest.slug, p.id,
+            )
+        };
+
+        let resp = client
+            .delete(url)
+            .basic_auth(&dest.username, Some(&dest.password))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            println!("failed to request");
+            return Ok(vec![]);
+        }
+
+        let result: Value = resp.json().await?;
+        println!("result: {}", result);
+    }
+
+    let permissions_after = list(dest).await.ok().unwrap();
+    Ok(permissions_after)
 }
