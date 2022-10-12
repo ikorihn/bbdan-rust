@@ -1,7 +1,7 @@
 use ansi_term::Colour;
 use chrono::{DateTime, Local};
 use clap::{ArgEnum, Parser, Subcommand};
-use dialoguer::{theme::ColorfulTheme, MultiSelect};
+use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -125,7 +125,14 @@ async fn main() {
                 slug: repo.to_string(),
             };
 
-            list(bitbucket).await;
+            let result = list(bitbucket).await;
+            println!("Repository: {}", repo.to_string());
+            for p in &result.ok().unwrap() {
+                println!(
+                    "{:?}, {:?}, {:?}, {:?}",
+                    p.object_type, p.id, p.alias, p.permission,
+                );
+            }
         }
         Commands::Copy {
             src_repo,
@@ -180,6 +187,7 @@ struct Bitbucket {
 //
 // }
 
+#[derive(Debug, Clone)]
 struct Permission {
     object_type: ObjectType,
     alias: String,
@@ -282,13 +290,6 @@ async fn list(bitbucket: Bitbucket) -> Result<Vec<Permission>, Box<dyn std::erro
         permissions.push(p);
     }
 
-    for p in &permissions {
-        println!(
-            "{:?}, {:?}, {:?}, {:?}",
-            p.object_type, p.id, p.alias, p.permission,
-        );
-    }
-
     Ok(permissions)
 }
 
@@ -301,7 +302,7 @@ async fn copy(
 
     let mut dest_ids: HashMap<String, &Permission> = HashMap::new();
     for p in &permissions_before {
-        dest_ids.insert(String::from(&p.id), &p);
+        dest_ids.insert(p.id.to_string(), &p);
     }
 
     let mut src_ids: HashSet<String> = HashSet::new();
@@ -312,19 +313,43 @@ async fn copy(
         if dest_ids.contains_key(&p.id) {
             let dests = dest_ids.get(&p.id).unwrap();
             if p.permission == dests.permission {
-                println!("Not update: id={}, name={}", p.id, p.alias);
+                println!("Not change: id={}, name={}", p.id, p.alias);
                 continue;
             } else {
-                println!(
-                    "Permission update: id={}, name={}, before={}, after={}",
+                let message = format!(
+                    "Permission update: id={}, name={}, before={}, after={}. Continue?",
                     p.id,
                     p.alias,
                     permission_type_to_str(p.permission),
                     permission_type_to_str(dests.permission),
                 );
+                if Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt(message)
+                    .default(true)
+                    .wait_for_newline(true)
+                    .interact()
+                    .unwrap()
+                {
+                    println!("Continue");
+                } else {
+                    println!("Skip");
+                    continue;
+                }
             }
         } else {
-            println!("Add: id={}, name={}", p.id, p.alias);
+            let message = format!("Add: id={}, name={}. Continue?", p.id, p.alias);
+            if Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt(message)
+                .default(true)
+                .wait_for_newline(true)
+                .interact()
+                .unwrap()
+            {
+                println!("Continue");
+            } else {
+                println!("Skip");
+                continue;
+            }
         }
 
         let url = if p.object_type == ObjectType::User {
@@ -341,6 +366,8 @@ async fn copy(
 
         let mut map = HashMap::new();
         map.insert("permission", permission_type_to_str(p.permission));
+
+        println!("PUT {}", url);
 
         let resp = client
             .put(url)
@@ -363,7 +390,19 @@ async fn copy(
             continue;
         }
 
-        println!("Remove: id={}, name={}", p.id, p.alias);
+        let message = format!("Remove: id={}, name={}. Continue?", p.id, p.alias);
+        if Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt(message)
+            .default(true)
+            .wait_for_newline(true)
+            .interact()
+            .unwrap()
+        {
+            println!("Continue");
+        } else {
+            println!("Skip");
+            continue;
+        }
         let url = if p.object_type == ObjectType::User {
             format!(
                 r#"{}/repositories/{}/{}/permissions-config/users/{}"#,
@@ -375,6 +414,8 @@ async fn copy(
                 BASE_URL, dest.workspace, dest.slug, p.id,
             )
         };
+
+        println!("DELETE {}", url);
 
         let resp = client
             .delete(url)
@@ -417,9 +458,36 @@ async fn remove(bitbucket: Bitbucket) -> Result<(), Box<dyn std::error::Error>> 
     if selections.is_empty() {
         println!("You did not select anything :(");
     } else {
-        println!("You selected these things:");
+        let client = reqwest::Client::new();
+
         for selection in selections {
-            println!("  {}", permissions[selection].alias);
+            let p = permissions[selection].clone();
+
+            let url = if p.object_type == ObjectType::User {
+                format!(
+                    r#"{}/repositories/{}/{}/permissions-config/users/{}"#,
+                    BASE_URL, bitbucket.workspace, bitbucket.slug, p.id,
+                )
+            } else {
+                format!(
+                    r#"{}/repositories/{}/{}/permissions-config/groups/{}"#,
+                    BASE_URL, bitbucket.workspace, bitbucket.slug, p.id,
+                )
+            };
+
+            let resp = client
+                .delete(url)
+                .basic_auth(&bitbucket.username, Some(&bitbucket.password))
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                println!("failed to request");
+                return Ok(());
+            }
+
+            let result: Value = resp.json().await?;
+            println!("result: {}", result);
         }
     };
 
