@@ -2,7 +2,7 @@ use ansi_term::Colour;
 use chrono::{DateTime, Local};
 use clap::{ArgEnum, Parser, Subcommand};
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
-use reqwest::StatusCode;
+use reqwest::{Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -150,7 +150,8 @@ async fn main() {
                 workspace: workspace.to_string(),
                 slug: dest_repo,
             };
-            copy(src, dest).await;
+            let result = copy(src, dest).await;
+            result.ok();
         }
         Commands::Remove { repo } => {
             let bitbucket = Bitbucket {
@@ -160,7 +161,8 @@ async fn main() {
                 slug: repo.to_string(),
             };
 
-            remove(bitbucket).await;
+            let result = remove(bitbucket).await;
+            result.ok();
         }
     }
 }
@@ -232,19 +234,56 @@ fn permission_type_to_str(p: PermissionType) -> String {
     }
 }
 
+struct BitbucketClient {
+    http_client: reqwest::Client,
+    base_url: String,
+    username: String,
+    password: String,
+}
+impl BitbucketClient {
+    fn new(
+        http_client: reqwest::Client,
+        base_url: String,
+        username: String,
+        password: String,
+    ) -> Self {
+        Self {
+            http_client,
+            base_url,
+            username,
+            password,
+        }
+    }
+
+    async fn http_get(&self, url: String) -> Result<Response, reqwest::Error> {
+        let full_url = format!(r#"{}/{}"#, self.base_url, url);
+        let resp = self
+            .http_client
+            .get(full_url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await;
+        return resp;
+    }
+}
+
 async fn list(bitbucket: Bitbucket) -> Result<Vec<Permission>, Box<dyn std::error::Error>> {
     let mut permissions: Vec<Permission> = Vec::new();
 
-    let url = format!(
-        r#"{}/repositories/{}/{}/permissions-config/groups"#,
-        BASE_URL, bitbucket.workspace, bitbucket.slug,
+    let client = BitbucketClient::new(
+        reqwest::Client::new(),
+        BASE_URL.to_string(),
+        bitbucket.username,
+        bitbucket.password,
     );
-    let client = reqwest::Client::new();
+
     let resp = client
-        .get(url)
-        .basic_auth(&bitbucket.username, Some(&bitbucket.password))
-        .send()
-        .await?;
+        .http_get(format!(
+            r#"repositories/{}/{}/permissions-config/groups"#,
+            bitbucket.workspace, bitbucket.slug,
+        ))
+        .await
+        .unwrap();
 
     if !resp.status().is_success() {
         println!("failed to get permission");
@@ -263,15 +302,13 @@ async fn list(bitbucket: Bitbucket) -> Result<Vec<Permission>, Box<dyn std::erro
         permissions.push(p);
     }
 
-    let url_users = format!(
-        r#"{}/repositories/{}/{}/permissions-config/users"#,
-        BASE_URL, bitbucket.workspace, bitbucket.slug,
-    );
     let resp_users = client
-        .get(url_users)
-        .basic_auth(bitbucket.username, Some(bitbucket.password))
-        .send()
-        .await?;
+        .http_get(format!(
+            r#"repositories/{}/{}/permissions-config/users"#,
+            bitbucket.workspace, bitbucket.slug,
+        ))
+        .await
+        .unwrap();
 
     if !resp_users.status().is_success() {
         println!("failed to get permission");
